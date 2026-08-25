@@ -8,9 +8,10 @@ for a set of queries. Outputs results as JSON.
 import argparse
 import json
 import os
-import select
+import queue
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -30,6 +31,32 @@ def find_project_root() -> Path:
         if (parent / ".claude").is_dir():
             return parent
     return current
+
+
+def _pump_lines(stream, out_queue: "queue.Queue") -> None:
+    """Feed a subprocess pipe into a queue one line at a time, on a worker thread.
+
+    Portable stand-in for the select.select()/os.read() loop this used to use.
+    That loop could not work on native Windows: Windows has no unified file
+    descriptor namespace, and its select() is a Winsock function that accepts
+    SOCKETs only, so passing a pipe fd raises
+    "OSError: [WinError 10038] An operation was attempted on something that is
+    not a socket" on the very first iteration and every query fails.  POSIX
+    select() is specified to support pipes; Winsock select() is not.
+
+    Reading whole *lines* rather than fixed-size chunks is deliberate: the
+    stream is newline-delimited JSON, and b"\\n" can never appear inside a
+    multi-byte UTF-8 sequence, so every queue item is a safe decode boundary.
+    A fixed 8192-byte chunk can split a multi-byte character and corrupt it.
+
+    Emits a None sentinel at EOF so the consumer can stop without polling the
+    process.
+    """
+    try:
+        for line in iter(stream.readline, b""):
+            out_queue.put(line)
+    finally:
+        out_queue.put(None)
 
 
 def run_single_query(
@@ -65,7 +92,7 @@ def run_single_query(
             f"# {skill_name}\n\n"
             f"This skill handles: {skill_description}\n"
         )
-        command_file.write_text(command_content)
+        command_file.write_text(command_content, encoding="utf-8")
 
         cmd = [
             "claude",
@@ -92,83 +119,84 @@ def run_single_query(
 
         triggered = False
         start_time = time.time()
-        buffer = ""
         # Track state for stream event detection
         pending_tool_name = None
         accumulated_json = ""
 
+        # Drain stdout on a daemon thread and hand whole lines back over a
+        # queue.  Queue.get(timeout=1.0) reproduces the 1-second wakeups the
+        # old select() call provided, so the per-query `timeout` is still
+        # enforced without busy-waiting.  See _pump_lines for why select()
+        # cannot be used here.
+        line_queue: "queue.Queue[bytes | None]" = queue.Queue()
+        reader_thread = threading.Thread(
+            target=_pump_lines, args=(process.stdout, line_queue), daemon=True
+        )
+        reader_thread.start()
+
         try:
             while time.time() - start_time < timeout:
-                if process.poll() is not None:
-                    remaining = process.stdout.read()
-                    if remaining:
-                        buffer += remaining.decode("utf-8", errors="replace")
-                    break
+                try:
+                    raw_line = line_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue  # nothing this interval; re-check the deadline
 
-                ready, _, _ = select.select([process.stdout], [], [], 1.0)
-                if not ready:
+                if raw_line is None:
+                    break  # EOF: the child closed stdout
+
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
                     continue
 
-                chunk = os.read(process.stdout.fileno(), 8192)
-                if not chunk:
-                    break
-                buffer += chunk.decode("utf-8", errors="replace")
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
+                # Early detection via stream events
+                if event.get("type") == "stream_event":
+                    se = event.get("event", {})
+                    se_type = se.get("type", "")
 
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    # Early detection via stream events
-                    if event.get("type") == "stream_event":
-                        se = event.get("event", {})
-                        se_type = se.get("type", "")
-
-                        if se_type == "content_block_start":
-                            cb = se.get("content_block", {})
-                            if cb.get("type") == "tool_use":
-                                tool_name = cb.get("name", "")
-                                if tool_name in ("Skill", "Read"):
-                                    pending_tool_name = tool_name
-                                    accumulated_json = ""
-                                else:
-                                    return False
-
-                        elif se_type == "content_block_delta" and pending_tool_name:
-                            delta = se.get("delta", {})
-                            if delta.get("type") == "input_json_delta":
-                                accumulated_json += delta.get("partial_json", "")
-                                if clean_name in accumulated_json:
-                                    return True
-
-                        elif se_type in ("content_block_stop", "message_stop"):
-                            if pending_tool_name:
-                                return clean_name in accumulated_json
-                            if se_type == "message_stop":
+                    if se_type == "content_block_start":
+                        cb = se.get("content_block", {})
+                        if cb.get("type") == "tool_use":
+                            tool_name = cb.get("name", "")
+                            if tool_name in ("Skill", "Read"):
+                                pending_tool_name = tool_name
+                                accumulated_json = ""
+                            else:
                                 return False
 
-                    # Fallback: full assistant message
-                    elif event.get("type") == "assistant":
-                        message = event.get("message", {})
-                        for content_item in message.get("content", []):
-                            if content_item.get("type") != "tool_use":
-                                continue
-                            tool_name = content_item.get("name", "")
-                            tool_input = content_item.get("input", {})
-                            if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
-                                triggered = True
-                            elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
-                                triggered = True
-                            return triggered
+                    elif se_type == "content_block_delta" and pending_tool_name:
+                        delta = se.get("delta", {})
+                        if delta.get("type") == "input_json_delta":
+                            accumulated_json += delta.get("partial_json", "")
+                            if clean_name in accumulated_json:
+                                return True
 
-                    elif event.get("type") == "result":
+                    elif se_type in ("content_block_stop", "message_stop"):
+                        if pending_tool_name:
+                            return clean_name in accumulated_json
+                        if se_type == "message_stop":
+                            return False
+
+                # Fallback: full assistant message
+                elif event.get("type") == "assistant":
+                    message = event.get("message", {})
+                    for content_item in message.get("content", []):
+                        if content_item.get("type") != "tool_use":
+                            continue
+                        tool_name = content_item.get("name", "")
+                        tool_input = content_item.get("input", {})
+                        if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
+                            triggered = True
+                        elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
+                            triggered = True
                         return triggered
+
+                elif event.get("type") == "result":
+                    return triggered
         finally:
             # Clean up process on any exit path (return, exception, timeout)
             if process.poll() is None:
@@ -269,7 +297,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print progress to stderr")
     args = parser.parse_args()
 
-    eval_set = json.loads(Path(args.eval_set).read_text())
+    eval_set = json.loads(Path(args.eval_set).read_text(encoding="utf-8"))
     skill_path = Path(args.skill_path)
 
     if not (skill_path / "SKILL.md").exists():
