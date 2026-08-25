@@ -59,6 +59,74 @@ def _pump_lines(stream, out_queue: "queue.Queue") -> None:
         out_queue.put(None)
 
 
+def _name_matches(value: object, clean_name: str, skill_name: str) -> bool:
+    """Does this tool-call value refer to the skill under evaluation?
+
+    Accepts the staged eval-only command name AND the skill's real registered
+    name.  The eval stages a decoy command called "<skill>-skill-<uuid>", but
+    when the skill is *also* already installed (~/.claude/skills/, a plugin
+    marketplace, or the project's .claude/skills/) the model will usually call
+    it by its real name.  Matching the decoy name alone scores every one of
+    those correct triggers as a miss, so an installed skill evaluates to 0.
+
+    Matched by equality, not substring, so an unrelated name that merely
+    contains the skill name does not count as a trigger.  Plugin-qualified
+    names ("some-plugin:my-skill") are accepted for the real name.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if value == clean_name or value == skill_name:
+        return True
+    return value.endswith(":" + skill_name)
+
+
+def _path_matches(value: object, clean_name: str, skill_name: str) -> bool:
+    """As _name_matches, but for a Read tool's file_path.
+
+    A Read of the skill counts as a trigger.  The decoy is a single .md file;
+    a really-installed skill is <something>/<skill_name>/SKILL.md, so compare
+    path *components* rather than doing a bare substring test.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if clean_name in value:
+        return True
+    parts = {p for p in value.replace("\\", "/").split("/") if p}
+    return skill_name in parts or f"{skill_name}.md" in parts
+
+
+def _accumulated_hit(
+    accumulated_json: str, tool_name: str, clean_name: str, skill_name: str
+) -> bool:
+    """Decide whether a (possibly incomplete) tool-input JSON names the skill.
+
+    `accumulated_json` arrives a fragment at a time from input_json_delta
+    events, so mid-stream it is usually not valid JSON yet.  We try, in order:
+
+      1. parse it as-is;
+      2. parse it with a closing quote+brace appended, which repairs the common
+         mid-string case '{"skill": "my-ski' -> '{"skill": "my-ski"}';
+      3. fall back to a substring test on the decoy name only.
+
+    Step 3 is restricted to the decoy because it embeds a random uuid and so
+    cannot collide with anything else; substring-testing the *real* skill name
+    would let an unrelated argument that merely mentions it count as a trigger.
+    """
+    field = "skill" if tool_name == "Skill" else "file_path"
+    match = _name_matches if tool_name == "Skill" else _path_matches
+
+    for candidate in (accumulated_json, accumulated_json + '"}'):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and match(parsed.get(field), clean_name, skill_name):
+            return True
+        break  # it parsed and did not match; appending would not change that
+
+    return clean_name in accumulated_json
+
+
 def run_single_query(
     query: str,
     skill_name: str,
@@ -172,12 +240,18 @@ def run_single_query(
                         delta = se.get("delta", {})
                         if delta.get("type") == "input_json_delta":
                             accumulated_json += delta.get("partial_json", "")
-                            if clean_name in accumulated_json:
+                            if _accumulated_hit(
+                                accumulated_json, pending_tool_name,
+                                clean_name, skill_name,
+                            ):
                                 return True
 
                     elif se_type in ("content_block_stop", "message_stop"):
                         if pending_tool_name:
-                            return clean_name in accumulated_json
+                            return _accumulated_hit(
+                                accumulated_json, pending_tool_name,
+                                clean_name, skill_name,
+                            )
                         if se_type == "message_stop":
                             return False
 
@@ -189,9 +263,13 @@ def run_single_query(
                             continue
                         tool_name = content_item.get("name", "")
                         tool_input = content_item.get("input", {})
-                        if tool_name == "Skill" and clean_name in tool_input.get("skill", ""):
+                        if tool_name == "Skill" and _name_matches(
+                            tool_input.get("skill"), clean_name, skill_name
+                        ):
                             triggered = True
-                        elif tool_name == "Read" and clean_name in tool_input.get("file_path", ""):
+                        elif tool_name == "Read" and _path_matches(
+                            tool_input.get("file_path"), clean_name, skill_name
+                        ):
                             triggered = True
                         return triggered
 
